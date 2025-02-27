@@ -1,87 +1,92 @@
 import cv2
 import mediapipe as mp
 import pyautogui
+import math
 
-# Initialize video capture from the default webcam (index 0)
+# Constants
+THRESHOLD_MULTIPLIER = 0.3  # Click threshold as a fraction of hand size
+N_STILL = 3  # Frames to check stillness
+MOVEMENT_THRESHOLD = 0.05  # Max movement for stillness (normalized)
+N_SMOOTH = 3  # Frames for smoothing cursor
+
+# Initialize video capture and Mediapipe
 cap = cv2.VideoCapture(0)
-if not cap.isOpened():
-    print("Error: Could not open video capture.")
-    exit()
-
-# Get the screen size for mapping hand coordinates to screen coordinates
+mp_hands = mp.solutions.hands
+hands = mp_hands.Hands(max_num_hands=1, min_detection_confidence=0.5)
 screen_width, screen_height = pyautogui.size()
 
-# Initialize Mediapipe Hands solution
-mp_hands = mp.solutions.hands
-hands = mp_hands.Hands(
-    static_image_mode=False, max_num_hands=1, min_detection_confidence=0.5
-)
-mp_draw = mp.solutions.drawing_utils
-
-# State variable to prevent multiple clicks during a single gesture
+# State variables
 was_clicking = False
+wrist_history = []  # Wrist positions for stillness
+position_history = []  # Cursor positions for smoothing
 
-# Main loop
 while True:
-    # Read a frame from the webcam
     ret, frame = cap.read()
     if not ret:
-        print("Error: Could not read frame.")
         break
-
-    # Flip the frame horizontally for a mirror-like effect (optional)
     frame = cv2.flip(frame, 1)
-
-    # Get frame dimensions
-    frame_height, frame_width, _ = frame.shape
-
-    # Convert the frame from BGR to RGB (Mediapipe requires RGB)
     frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-
-    # Process the frame to detect hands
     results = hands.process(frame_rgb)
 
-    # If hands are detected, process gestures
     if results.multi_hand_landmarks:
         for hand_landmarks in results.multi_hand_landmarks:
-            # Draw hand landmarks on the frame for visual feedback
-            mp_draw.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
-
-            # Get index finger tip coordinates (landmark 8)
+            # Key landmarks
+            wrist = hand_landmarks.landmark[0]
+            middle_base = hand_landmarks.landmark[9]
             index_tip = hand_landmarks.landmark[8]
-            index_x = int(index_tip.x * frame_width)
-            index_y = int(index_tip.y * frame_height)
-
-            # Get thumb tip coordinates (landmark 4)
             thumb_tip = hand_landmarks.landmark[4]
-            thumb_x = int(thumb_tip.x * frame_width)
-            thumb_y = int(thumb_tip.y * frame_height)
 
-            # Calculate distance between thumb and index finger tips
-            distance = ((index_x - thumb_x) ** 2 + (index_y - thumb_y) ** 2) ** 0.5
+            # Normalized distances
+            ref_distance = math.hypot(wrist.x - middle_base.x, wrist.y - middle_base.y)
+            distance_norm = math.hypot(
+                index_tip.x - thumb_tip.x, index_tip.y - thumb_tip.y
+            )
+            threshold = ref_distance * THRESHOLD_MULTIPLIER
 
-            # Perform a click if fingers are close (threshold: 30 pixels)
-            if distance < 30:
-                if not was_clicking:
-                    pyautogui.click()
-                    was_clicking = True
-            else:
+            # Stillness check
+            wrist_history.append((wrist.x, wrist.y))
+            if len(wrist_history) > N_STILL:
+                wrist_history.pop(0)
+            total_movement = (
+                float("inf")
+                if len(wrist_history) < N_STILL
+                else sum(
+                    math.hypot(
+                        wrist_history[i][0] - wrist_history[i - 1][0],
+                        wrist_history[i][1] - wrist_history[i - 1][1],
+                    )
+                    for i in range(1, N_STILL)
+                )
+            )
+
+            # Click logic
+            if (
+                distance_norm < threshold
+                and total_movement < MOVEMENT_THRESHOLD
+                and not was_clicking
+                and len(wrist_history) >= N_STILL
+            ):
+                pyautogui.click()
+                was_clicking = True
+            elif distance_norm >= threshold:
                 was_clicking = False
 
-            # Map index finger position to screen coordinates
-            screen_x = int(index_x * screen_width / frame_width)
-            screen_y = int(index_y * screen_height / frame_height)
+            # Smooth cursor movement
+            screen_x, screen_y = index_tip.x * screen_width, index_tip.y * screen_height
+            position_history.append((screen_x, screen_y))
+            if len(position_history) > N_SMOOTH:
+                position_history.pop(0)
+            avg_x = sum(p[0] for p in position_history) / len(position_history)
+            avg_y = sum(p[1] for p in position_history) / len(position_history)
+            pyautogui.moveTo(avg_x, avg_y)
 
-            # Move the cursor to the mapped position
-            pyautogui.moveTo(screen_x, screen_y)
+    else:
+        wrist_history.clear()
+        position_history.clear()
 
-    # Display the frame with hand landmarks
     cv2.imshow("Hand Detection", frame)
-
-    # Exit the loop when 'q' is pressed
     if cv2.waitKey(1) & 0xFF == ord("q"):
         break
 
-# Clean up: release the video capture and close all windows
 cap.release()
 cv2.destroyAllWindows()
